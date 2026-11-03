@@ -1,0 +1,18 @@
+# Large or local files that should stay out of the image; the data folders are mounted at run time
+.git
+.gitignore
+.dockerignore
+Dockerfile
+.idea
+.venv
+.pytest_cache
+**/__pycache__
+**/*.py[cod]
+**/.DS_Store
+dataset
+models
+output
+outputs
+logs
+results
+sil.model*

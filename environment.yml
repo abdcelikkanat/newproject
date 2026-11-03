@@ -1,0 +1,13 @@
+name: mysemibin
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  # Command-line tools used by the evaluation
+  - bedtools=2.31.1  # coverage computation
+  - prodigal=2.6.3   # gene prediction for the single-copy marker genes
+  - hmmer=3.4        # hmmsearch for the marker gene search
+  - pip
+  - pip:
+      - -r requirements.txt
