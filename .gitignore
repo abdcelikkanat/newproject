@@ -170,3 +170,6 @@ logs
 results
 *.out
 *.err
+
+# Apptainer/Singularity images
+*.sif

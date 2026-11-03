@@ -1,4 +1,4 @@
-name: mysemibin
+name: newproject
 channels:
   - conda-forge
   - bioconda

@@ -1,0 +1,41 @@
+Bootstrap: docker
+# NVIDIA's PyTorch image: CUDA, cuDNN, NCCL and a GPU build of PyTorch are already installed.
+# Use a recent tag from https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch whose Python
+# is 3.12 or newer (23.04 ships Python 3.8, which is too old for requirements.txt), and whose CUDA
+# version is supported by the driver on the AI-Cloud GPU nodes.
+From: nvcr.io/nvidia/pytorch:25.01-py3
+
+%files
+    # Relative to the folder where the build is started (the repo root)
+    requirements.txt /opt/newproject/requirements.txt
+
+%post
+    # Command-line tools used by the evaluation
+    apt-get update
+    apt-get install -y --no-install-recommends bedtools prodigal hmmer
+    rm -rf /var/lib/apt/lists/*
+
+    # Keep the image's own PyTorch: installing the torch wheel from requirements.txt would replace
+    # NVIDIA's CUDA build. Install only the other packages.
+    # If pip reports a conflict with /etc/pip/constraint.txt (the image pins some packages, e.g. numpy),
+    # loosen that pin in requirements.txt instead of overriding the image's packages.
+    grep -v '^torch==' /opt/newproject/requirements.txt > /opt/newproject/requirements-notorch.txt
+    pip install --no-cache-dir -r /opt/newproject/requirements-notorch.txt
+
+%environment
+    # Show the progress messages immediately in the Slurm logs
+    export PYTHONUNBUFFERED=1
+    # Ignore packages from ~/.local, which the container sees because the home folder is mounted
+    export PYTHONNOUSERSITE=1
+
+%test
+    python -c "import torch, numpy, scipy, sklearn, pandas; print('torch', torch.__version__)"
+    bedtools --version
+    prodigal -v
+    hmmsearch -h | head -n 2
+
+%help
+    Environment for newproject (the code is not in the image). Run from the repo root.
+    The same image works with and without GPUs; leave out --gres and --nv on CPU nodes:
+        srun --gres=gpu:1 singularity exec --nv newproject.sif python -m evaluation.evaluation --help   # GPU
+        srun singularity exec newproject.sif python -m evaluation.evaluation --help                     # CPU

@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 # The PyTorch wheel index: CPU-only by default. For NVIDIA GPUs, build with e.g.
-#   docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130 -t mysemibin .
+#   docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130 -t newproject .
 # and run the container with --gpus all
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
