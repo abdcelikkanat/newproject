@@ -35,7 +35,7 @@ if __name__ == "__main__":
         '--k', type=int, default=4, help='k value'
     )
     parser.add_argument(
-        '--kmer_counting_method', type=str, default="canonical", help='The approach to design k-mer features'
+        '--kmer_counting_method', type=str, default="uncanonical", help='The approach to design k-mer features'
     )
     parser.add_argument(
         '--min_contig_len', type=int, default=1000, help='Length of minimum contig length'
@@ -51,6 +51,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--bin_total_min_len', type=int, default=200_000, help='Total minimum length of bin'
+    )
+    parser.add_argument(
+        '--loss_name', type=str, default="mahalanobis", help='Loss function (l2, bern_hinge_squared, mahalanobis)'
     )
 
     args = parser.parse_args()
@@ -100,22 +103,28 @@ if __name__ == "__main__":
             contig_lens.append(len(seq))
             contig_seqs[contig_name] = seq
             kmer_feature = torch.from_numpy(tokenizer.encode(seq)).to(torch.float).unsqueeze(0)
-            contig_embs.append(model(kmer_feature))
+            emb = model.forward(kmer_feature)
+            contig_embs.append(torch.cat(emb, dim=1) if args.loss_name == "mahalanobis" else emb[0])
 
     contig_embs = torch.cat(contig_embs, dim=0)
     contig_lens = np.asarray(contig_lens)
     # Construct a pandas data frame for the embeddings
-    contig_embs_df = pd.DataFrame(data=contig_embs.numpy(), index=contig_names,
-                                  columns=[f"Dim_{d}" for d in range(contig_embs.shape[1])])
+    if args.loss_name == "mahalanobis":
+        _columns = [f"{name}_dim_{d}" for name in ["mean", "cov"] for d in range(contig_embs.shape[1]//2)]
+    else:
+        _columns = [f"dim_{d}" for d in range(contig_embs.shape[1])]
+    contig_embs_df = pd.DataFrame(data=contig_embs.numpy(), index=contig_names, columns=_columns)
     print(f"\t- Done in {time.time() - init_time} seconds.")
 
     # Get the coverage features, indexed by the contig name
     print(f"+ Reading the bam file to calculating coverage values.")
     init_time = time.time()
-    bam_contig_names, contig_depth_means, contig_depth_vars = compute_coverage(bam_file_path=bam_file_path,
-                                                                               edge_len=edge_len)
-    depth_df = pd.DataFrame(data={"mean": np.log(contig_depth_means), "var": np.log(contig_depth_vars)},
-                            index=bam_contig_names)
+    bam_contig_names, contig_depth_means, contig_depth_vars = compute_coverage(
+        bam_file_path=bam_file_path, edge_len=edge_len
+    )
+    depth_df = pd.DataFrame(
+        data={"mean": np.log(contig_depth_means), "var": np.log(contig_depth_vars)}, index=bam_contig_names
+    )
     print(f"\t- Done in {time.time() - init_time} seconds.")
 
     # Match the features by the contig name: keep only contigs present in all inputs, in the FASTA order
@@ -151,11 +160,37 @@ if __name__ == "__main__":
 
     # Build a sparse k-nearest neighbor distance graph so that DBSCAN does not need the full distance matrix
     print(f"\t- kNN distance graph is being constructed.")
-    dist_matrix = kneighbors_graph(
-        clustering_features, n_neighbors=min(dbscan_max_neighbors, clustering_features.shape[0] - 1),
-        mode="distance", p=2,
-        n_jobs=-1  # use all jobs
-    )
+    if args.loss_name == "mahalanobis":
+
+        def custom_metric(x, y):
+
+            assert x.ndim == 1, "It must be a vector!"
+
+            x_mean, x_cov = x[:len(x) // 2], x[len(x) // 2:]
+            y_mean, y_cov = y[:len(y) // 2], y[len(y) // 2:]
+
+            return np.sqrt(((x_mean - y_mean) ** 2 / (x_cov + y_cov)).sum())
+
+
+        # Swap column 0 and column 2 in-place
+        _dim = (clustering_features.shape[1] -1 ) // 2
+        emb_new = np.hstack((
+            np.hstack(( clustering_features[:, :_dim], clustering_features[:, [-1]])),
+            np.hstack(( clustering_features[:, _dim:-1], np.ones(shape=(clustering_features.shape[0], 1)) )),
+        ))
+
+        dist_matrix = kneighbors_graph(
+            emb_new, n_neighbors=min(dbscan_max_neighbors, emb_new.shape[0] - 1),
+            mode='distance', metric=custom_metric,
+            n_jobs=-1
+        )
+
+    else:
+        dist_matrix = kneighbors_graph(
+            clustering_features, n_neighbors=min(dbscan_max_neighbors, clustering_features.shape[0] - 1),
+            mode="distance", p=2,
+            n_jobs=-1  # use all jobs
+        )
     # Sort the neighbors of each row by distance once, instead of DBSCAN doing it for every eps value
     dist_matrix = sort_graph_by_row_values(dist_matrix, warn_when_not_sorted=False)
 

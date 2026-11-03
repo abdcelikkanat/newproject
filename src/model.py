@@ -39,25 +39,29 @@ class Model(torch.nn.Module):
         set_seed(self.__seed)
 
         # Define the layers
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Linear(self.__input_dim, 512),
-            torch.nn.BatchNorm1d(512),
-            torch.nn.LeakyReLU(),
+        self.mean_encoder = torch.nn.Sequential(
+            torch.nn.Linear(self.__input_dim, 512, dtype=torch.float),
+            torch.nn.BatchNorm1d(512, dtype=torch.float),
+            torch.nn.Sigmoid(),
             torch.nn.Dropout(0.2),
-            torch.nn.Linear(512, 512),
-            torch.nn.BatchNorm1d(512),
-            torch.nn.LeakyReLU(),
+            torch.nn.Linear(512, self.__out_dim, dtype=torch.float),
+        )
+
+        self.cov_encoder = torch.nn.Sequential(
+            torch.nn.Linear(self.__input_dim, 512, dtype=torch.float),
+            torch.nn.BatchNorm1d(512, dtype=torch.float),
+            torch.nn.Sigmoid(),
             torch.nn.Dropout(0.2),
-            torch.nn.Linear(512, self.__out_dim),
+            torch.nn.Linear(512, self.__out_dim, dtype=torch.float),
         )
 
     def forward(self, input: torch.Tensor):
         """
         Forward pass
         """
-        embs = self.encoder(input)
+        mean_embs, cov_embs = self.mean_encoder(input), torch.exp(self.cov_encoder(input))
 
-        return embs
+        return (mean_embs, cov_embs)
 
     def get_input_dim(self):
         """
@@ -88,7 +92,8 @@ class Model(torch.nn.Module):
 
 
 def loss_func(
-        left_embs: torch.Tensor, right_embs: torch.Tensor, labels: torch.Tensor, loss_name:str = "mahalanobis",
+        left_embs: torch.Tensor, right_embs: torch.Tensor, labels: torch.Tensor,
+        loss_name:str = "mahalanobis", threshold: float = 1.0, include_cov: bool = False,
 ):
     """
     Definition of the loss functions
@@ -96,18 +101,47 @@ def loss_func(
 
     if loss_name == "l2":
 
-        squared_dist = torch.norm(left_embs - right_embs, dim=1) ** 2
+        left_mean, right_mean = left_embs[0], right_embs[0]
+
+        squared_dist = torch.norm(left_mean - right_mean, dim=1) ** 2
         output = labels * squared_dist - (1 - labels) * torch.log(1 - torch.exp(-squared_dist) + 1e-6)
         return output.mean()
 
     elif loss_name == "bern_hinge_squared":
 
+        left_mean, right_mean = left_embs[0], right_embs[0]
+
         # This loss is the function used in SemiBin2 implementation
-        dist = torch.norm(left_embs - right_embs, p=2, dim=1)
+        dist = torch.norm(left_mean - right_mean, p=2, dim=1)
         squared_dist = torch.square(dist)
         squared_margin = torch.square(torch.nn.functional.relu(1 - dist))
         output = labels * squared_dist + (1 - labels) * squared_margin
 
+        return output.mean()
+
+    elif loss_name == "mahalanobis":
+
+        left_mean, left_cov = left_embs
+        right_mean, right_cov = right_embs
+
+        # Compute the term (m_i - m_j)^2
+        squared_diff = (left_mean - right_mean) ** 2
+
+        if not include_cov:
+
+            # Compute the log expectation
+            log_expectation = -squared_diff.sum(dim=1) / 4.
+
+        else:
+
+            # Compute the term (m_i - m_j)^2 / (s_i + s_j)
+            squared_diff = squared_diff / (left_cov + right_cov)
+
+            # Compute the log expectation
+            log_expectation = -squared_diff.sum(dim=1) / 1.
+
+        output = -labels * log_expectation - (1 - labels) * torch.log(
+            1 - torch.exp(torch.nn.functional.threshold(log_expectation, -threshold, 0)) + 1e-6)
         return output.mean()
 
     else:
@@ -156,29 +190,78 @@ def train_single_epoch(device, model, criterion, optimizer, data_loader):
     return average_epoch_loss
 
 def train(
-        device, distributed, model, lr, loss_name, loss_threshold, data_loader, epoch_num: int, save_every:int,
+        device, distributed, model, strategy, lr, loss_name, loss_threshold, data_loader, epoch_num: int, save_every:int,
         output_path, summary_writer
 ):
+    # Check the strategy name
+    assert strategy in ["sequential", "mean_only", "cov_only", "together"], f"Unknown strategy name: {strategy}"
+    assert not distributed, "Distributed training is currently not supported."
 
+    ### Define the optimizer
+    # At the beginning, we will not train the standard deviation parameters if the strategy is "sequential" or "mean_only"
+    include_cov = False if strategy in ["sequential", "mean_only"] else True
     # Get the model parameters to train
-    model_params = model.parameters()
+    model_params = []
+    for name, param in model.named_parameters():
+        if 'cov' in name and (strategy in ["sequential", "mean_only"]):
+            param.requires_grad = False
+        elif 'mean' in name and strategy in ["cov_only"]:
+            param.requires_grad = False
+        else:
+            model_params.append(param)
 
-    # Define the loss function.
-    criterion = partial(loss_func, loss_name=loss_name)
+    ### Define the loss function.
+    # Since we won't train the cov weights at the beginning, we will not include them in the loss function
+    criterion = partial(loss_func, loss_name=loss_name, threshold=loss_threshold, include_cov=include_cov)
     # Define the optimizer
     optimizer = torch.optim.Adam(model_params, lr=lr)
 
     ### Start training
     print(f"+ Training started.")
 
-    # Set the correct training modes
-    model.encoder.train()
+    # Set the correct training/evaluation modes
+    if strategy in ["mean_only", "sequential"]:
+        model.mean_encoder.train()
+        model.cov_encoder.eval()
+    elif strategy == "cov_only":
+        model.cov_encoder.train()
+        model.mean_encoder.eval()
+    elif strategy == "together":
+        model.mean_encoder.train()
+        model.cov_encoder.train()
+    else:
+        raise ValueError(f"Unknown strategy name: {strategy}")
 
     for current_epoch in range(epoch_num):
 
         # Set the epoch for the sampler
         if distributed:
             data_loader.sampler.set_epoch(current_epoch)
+
+        # For the second half of the training, we will also train the std weights if the strategy is "sequential"
+        if (current_epoch + 1) > epoch_num * (1. / 2) and include_cov == False and strategy == "sequential":
+
+            # # Set the gradient of the std weights to True
+            std_params = []
+            for name, param in model.named_parameters():
+                param.requires_grad = False
+                if 'cov' in name:
+                    param.requires_grad = True
+                    std_params.append(param)
+
+            # Set the include_std to True
+            include_cov = True
+            # Define the optimizer
+            optimizer = torch.optim.Adam(std_params, lr=lr)
+            # Define the loss function
+            criterion = partial(loss_func, threshold=loss_threshold, loss_name=loss_name, include_cov=include_cov)
+            if (distributed and device == 0) or (not distributed):
+                print(f"   - Only the covariance parameters are included in the optimizer now! (lr = {lr})")
+
+            # Set the correct model modes
+            model.mean_encoder.eval()
+            model.cov_encoder.train()
+
 
         # Run the training for the current epoch
         init_time = time.time()
@@ -229,7 +312,7 @@ def train(
 
 def main_worker(
         device, world_size, distributed:bool, training_dataset: PairDataset, output_path: str, checkpoint: str,
-        out_dim: int, lr:float, epoch_num:int, batch_size:int, loss_name: str, loss_threshold:float,
+        out_dim: int, strategy: str, lr:float, epoch_num:int, batch_size:int, loss_name: str, loss_threshold:float,
         workers_num: int, save_every: int, log_dir:str, seed: int,
 ):
     ### Initialize the device
@@ -273,9 +356,9 @@ def main_worker(
 
     ### Train the model
     train(
-        device=device, distributed=distributed, model=model, lr=lr, loss_name=loss_name, loss_threshold=loss_threshold,
-        data_loader=training_loader, epoch_num=epoch_num, save_every=save_every, output_path=output_path,
-        summary_writer=summary_writer,
+        device=device, distributed=distributed, model=model, strategy=strategy, lr=lr, loss_name=loss_name,
+        loss_threshold=loss_threshold, data_loader=training_loader, epoch_num=epoch_num, save_every=save_every,
+        output_path=output_path, summary_writer=summary_writer,
     )
 
     # Close the summary writer
@@ -309,6 +392,9 @@ if __name__ == "__main__":
         '--k', type=int, default=4, help='k value'
     )
     parser.add_argument(
+        '--tokenizer_method', type=str, default="uncanonical", help="Tokenizer method ('canonical', 'uncanonical')"
+    )
+    parser.add_argument(
         '--out_dim', type=int, default=256, help='Output dimension value'
     )
     parser.add_argument(
@@ -324,10 +410,14 @@ if __name__ == "__main__":
         '--lr', type=float, default=0.001, help='Learning rate'
     )
     parser.add_argument(
-        '--loss_name', type=str, default="l2", help='Loss function (l2, bern_hinge_squared)'
+        '--loss_name', type=str, default="mahalanobis", help='Loss function (l2, bern_hinge_squared, mahalanobis)'
     )
     parser.add_argument(
         '--loss_threshold', type=float, default=1.0, help='Loss threshold value'
+    )
+    parser.add_argument(
+        '--strategy', type=str, default="sequential",
+        help='Learning starting strategy (sequential, mean_only, cov_only, together)'
     )
     parser.add_argument(
         '--batch_size', type=int, default=100000, help='Batch size (0: no batch)'
@@ -373,6 +463,7 @@ if __name__ == "__main__":
     print(f"+ Information")
     # Get the model name from the output path
     print(f"\t- k value: {args.k}")
+    print(f"\t- Tokenizer method: {args.tokenizer_method}")
     print(f"\t- Loss name: {args.loss_name}")
     print(f"\t- Loss threshold value: {args.loss_threshold}")
     print(f"\t- Epoch number: {args.epoch}")
@@ -383,6 +474,7 @@ if __name__ == "__main__":
     print(f"\t- Maximum number of sequence pairs to use: {args.max_seq_num}")
     if args.checkpoint != "":
         print(f"\t- Checkpoint file: {args.checkpoint}")
+    print(f"\t- Learning starting strategy: {args.strategy}")
     if args.distributed:
         print(f"\t- Distributed training is activated with {world_size} GPUs")
     else:
@@ -393,7 +485,7 @@ if __name__ == "__main__":
     print(f"\t- Output model name: {os.path.basename(args.output)}")
 
     ### Read the dataset and construct the tokenizer
-    tokenizer = KmerTokenizer(k=args.k, counting_method = "canonical")
+    tokenizer = KmerTokenizer(k=args.k, counting_method = args.tokenizer_method)
     training_dataset = PairDataset(
         file_path=args.input, tokenizer=tokenizer, neg_sample_per_pos=args.neg_sample_per_pos,
         input_type=args.input_type, max_seq_num=args.max_seq_num, seed=args.seed,
@@ -401,8 +493,8 @@ if __name__ == "__main__":
 
     # Define the arguments for the main worker function
     arguments = (
-        world_size, args.distributed, training_dataset, args.output, args.checkpoint, args.out_dim, args.lr,
-        args.epoch, args.batch_size, args.loss_name, args.loss_threshold, args.workers, args.save_every,
+        world_size, args.distributed, training_dataset, args.output, args.checkpoint, args.out_dim, args.strategy,
+        args.lr, args.epoch, args.batch_size, args.loss_name, args.loss_threshold, args.workers, args.save_every,
         args.log_dir, args.seed,
     )
     if args.distributed:

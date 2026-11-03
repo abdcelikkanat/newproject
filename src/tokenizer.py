@@ -9,6 +9,8 @@ _BASE_COMPLEMENT = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
 class KmerTokenizer:
     def __init__(self, k, counting_method = "canonical"):
 
+        assert counting_method in ["canonical", "uncanonical"], "Invalid counting method!"
+
         # Define the letters, k-mer size, and the base complement
         self.__k = k
         # Define the k-mers
