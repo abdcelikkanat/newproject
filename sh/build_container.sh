@@ -24,6 +24,16 @@ output_sif=${2:-${input_def%.def}.sif}
 # Slurm runs a copy of this script, so resolve relative paths from the submit folder
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
+if [ ! -f "$input_def" ]; then
+    echo "Definition file '$input_def' not found in $PWD. Submit from the repo root, e.g." >&2
+    echo "    cd <repo root> && sbatch --partition=cpu sh/build_container.sh" >&2
+    exit 1
+fi
+if [ -d "$output_sif" ]; then
+    echo "The output '$output_sif' is a folder; give an image file name such as newproject.sif." >&2
+    exit 1
+fi
+
 # Newer clusters provide apptainer, older ones singularity (both read the same definition file)
 if command -v apptainer > /dev/null; then
     runtime=apptainer
